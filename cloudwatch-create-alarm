@@ -1,0 +1,154 @@
+#!/bin/bash
+
+SCRIPT=`basename $0`
+
+function usage () {
+    echo ""
+    echo "$SCRIPT -a [alarm name] -t [topic name] -e [email] -c [path to aws cli]"
+    echo ""
+}
+
+while getopts a:t:e:c: OPT
+do
+    case $OPT in
+        "a" )
+            if [ ! -e $OPTTAG ]; then
+                echo "-a: alarm name"
+                usage
+                exit 1
+            fi
+            ALARM_NAME=$OPTARG
+            ;;
+        "t" )
+            if [ ! -e $OPTTAG ]; then
+                echo "-a: topic name"
+                usage
+                exit 1
+            fi
+            TOPIC_NAME=$OPTARG
+            ;;
+        "e" )
+            if [ ! -e $OPTTAG ]; then
+                echo "-e: email"
+                usage
+                exit 1
+            fi
+            EMAIL=$OPTARG
+            ;;
+        "c" )
+            AWS_CLI=$OPTARG
+            ;;
+        "*" )
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+if [ -z "$ALARM_NAME" ] && [ -z "$TOPIC_NAME" ] && [ -z "$EMAIL" ]; then
+    usage
+    exit 1
+fi
+
+AWS=${AWS_CLI:-/usr/bin/aws}
+
+INSTANCE_ID=$( curl -s http://169.254.169.254/latest/meta-data/instance-id )
+
+SNS_TOPIC=$( ${AWS} sns list-topics --query "Topics[?contains(TopicArn,\`${TOPIC_NAME}\`)].TopicArn" --output text )
+
+if [ -z ${SNS_TOPIC} ]; then
+    RES=$( ${AWS} sns create-topic --name "${TOPIC_NAME}" --out text)
+    echo "create topic : $RES"
+fi
+
+SNS_TOPIC_ARN=$( ${AWS} sns list-topics --query "Topics[?contains(TopicArn,\`${TOPIC_NAME}\`)].TopicArn" --output text )
+
+SNS_SNS_SUB=$( ${AWS} sns list-subscriptions-by-topic --topic-arn "${SNS_TOPIC_ARN}" |\
+    jq -r --arg endpoint ${EMAIL} '.Subscriptions[] | select( .Endpoint == $endpoint )' )
+
+REGION=$( ${AWS} ec2 describe-instances --instance-ids ${INSTANCE_ID} --query\
+    'Reservations[].Instances[].Placement[].AvailabilityZone' --out text | sed -e 's/.$//g' )
+
+if [ -z "$SNS_SNS_SUB" ] ; then
+    RES=$( ${AWS} sns subscribe --protocol "email" --topic-arn "${SNS_TOPIC_ARN}" --notification-endpoint "${EMAIL}" --out text)
+    echo "create subscribe : $RES"
+fi
+
+for ALARM in CPUUtilization StatusCheckFailed_System StatusCheckFailed CPUCreditBalance
+do
+    EXITS=$(${AWS} cloudwatch describe-alarms --query\
+        "MetricAlarms[?MetricName==\`${ALARM}\`].Dimensions[]"\
+        --output text | grep -e '^InstanceId' | cut -f 2 | grep "${INSTANCE_ID}")
+
+    if [ -z "$EXITS" ] && [ "$ALARM" = 'CPUUtilization' ] ; then
+        $(${AWS} cloudwatch put-metric-alarm\
+         --alarm-name "${ALARM_NAME} ${INSTANCE_ID} High CPU Utilization"\
+         --alarm-description "Alarm : High CPU Utilization"\
+         --alarm-actions "${SNS_TOPIC_ARN}"\
+         --metric-name "CPUUtilization"\
+         --namespace "AWS/EC2"\
+         --statistic "Average"\
+         --period "300"\
+         --threshold "90"\
+         --evaluation-periods "2"\
+         --comparison-operator "GreaterThanThreshold"\
+         --dimensions "Name=InstanceId,Value=${INSTANCE_ID}"\
+         --unit "Percent")
+        echo "create alarm CPUUtilization"
+    fi
+
+    if [ -z "$EXITS" ] && [ "$ALARM" = 'StatusCheckFailed_System' ] ; then
+        $(${AWS} cloudwatch put-metric-alarm\
+        --region "${REGION}" \
+        --alarm-name "${ALARM_NAME} ${INSTANCE_ID} Auto Recover EC2 Instance" \
+        --alarm-description "Auto Recover EC2 Instance" \
+        --alarm-actions \
+            "arn:aws:automate:${REGION}:ec2:recover" \
+            "${SNS_TOPIC_ARN}" \
+        --metric-name "StatusCheckFailed_System" \
+        --namespace "AWS/EC2" \
+        --statistic "Average" \
+        --period "300" \
+        --threshold "1" \
+        --evaluation-periods "1"\
+        --comparison-operator "GreaterThanOrEqualToThreshold" \
+        --dimensions "Name=InstanceId,Value=${INSTANCE_ID}"\
+        --unit "Count")
+        echo "create alarm StatusCheckFailed_System"
+    fi
+
+    if [ -z "$EXITS" ] && [ "$ALARM" = 'StatusCheckFailed' ] ; then
+        $(${AWS} cloudwatch put-metric-alarm\
+         --alarm-name "${ALARM_NAME} ${INSTANCE_ID} Server down"\
+         --alarm-description "Alarm : Server down"\
+         --alarm-actions "${SNS_TOPIC_ARN}"\
+         --metric-name "StatusCheckFailed"\
+         --namespace "AWS/EC2"\
+         --statistic "Average" \
+         --period "300" \
+         --threshold "1" \
+         --evaluation-periods "1"\
+         --comparison-operator "GreaterThanOrEqualToThreshold"\
+         --dimensions "Name=InstanceId,Value=${INSTANCE_ID}"\
+         --unit "Count")
+        echo "create alarm StatusCheckFailed"
+    fi
+
+    if [ -z "$EXITS" ] && [ "$ALARM" = 'CPUCreditBalance' ] ; then
+        $(${AWS} cloudwatch put-metric-alarm\
+         --alarm-name "${ALARM_NAME} ${INSTANCE_ID} Credit is missing"\
+         --alarm-description "Alarm : Credit is missing"\
+         --alarm-actions "${SNS_TOPIC_ARN}"\
+         --metric-name "CPUCreditBalance"\
+         --namespace "AWS/EC2"\
+         --statistic "Average" \
+         --period "300" \
+         --threshold "50" \
+         --evaluation-periods "1"\
+         --comparison-operator "LessThanOrEqualToThreshold"\
+         --dimensions "Name=InstanceId,Value=${INSTANCE_ID}"\
+         --unit "Count")
+        echo "create alarm CPUCreditBalance"
+    fi
+done
+exit 0
